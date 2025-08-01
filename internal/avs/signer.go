@@ -6,6 +6,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	psbtlib "github.com/btcsuite/btcutil/psbt"
 )
 
 // AVSSigner represents an AVS node that can sign PSBTs
@@ -50,20 +53,19 @@ type SigningResponse struct {
 
 // NewAVSSigner creates a new AVS signer
 func NewAVSSigner(nodeID string) (*AVSSigner, error) {
-	// Generate a simple private key
-	privateKey := make([]byte, 32)
-	_, err := rand.Read(privateKey)
+	// Generate a proper ECDSA private key
+	privKey, err := btcec.NewPrivateKey()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate private key: %v", err)
 	}
 
-	// Create a simple public key (hash of private key)
-	publicKey := sha256.Sum256(privateKey)
+	// Get the public key
+	pubKey := privKey.PubKey()
 
 	return &AVSSigner{
 		NodeID:     nodeID,
-		PrivateKey: privateKey,
-		PublicKey:  publicKey[:],
+		PrivateKey: privKey.Serialize(),
+		PublicKey:  pubKey.SerializeCompressed(),
 		KeyShares:  make(map[string][]byte),
 		Consensus:  NewConsensusManager(),
 	}, nil
@@ -192,13 +194,22 @@ func (avs *AVSSigner) SignPSBT(packet interface{}) ([]byte, error) {
 	// Create a hash of the PSBT for signing
 	psbtHash := hashPSBT(packet)
 
-	// Sign the hash using a simple XOR-based signature
-	signature := make([]byte, len(psbtHash))
-	for i, b := range psbtHash {
-		signature[i] = b ^ avs.PrivateKey[i%len(avs.PrivateKey)]
+	// Convert private key to btcec.PrivateKey
+	privKey, _ := btcec.PrivKeyFromBytes(avs.PrivateKey)
+	if privKey == nil {
+		return nil, fmt.Errorf("invalid private key")
 	}
 
-	return signature, nil
+	// Sign the hash using ECDSA
+	signature, err := privKey.Sign(psbtHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign PSBT hash: %v", err)
+	}
+
+	// Convert signature to DER format
+	signatureDER := signature.Serialize()
+
+	return signatureDER, nil
 }
 
 // hashPSBT creates a hash of the PSBT for signing
@@ -212,9 +223,79 @@ func hashPSBT(packet interface{}) []byte {
 
 // applySignaturesToPSBT applies signatures to the PSBT
 func applySignaturesToPSBT(packet interface{}, signatures [][]byte) (interface{}, error) {
-	// For now, just return the original packet
-	// In a real implementation, this would apply the signatures
-	return packet, nil
+	// Type assert the packet to PSBT
+	psbtPacket, ok := packet.(*psbtlib.Packet)
+	if !ok {
+		return nil, fmt.Errorf("invalid packet type, expected *psbtlib.Packet")
+	}
+
+	// Create a copy of the packet to avoid modifying the original
+	signedPacket := *psbtPacket
+
+	// Apply signatures to each input that needs signing
+	for i, input := range signedPacket.Inputs {
+		if len(input.PartialSigs) == 0 {
+			// This input needs signatures
+			if i < len(signatures) {
+				// Apply the signature to this input
+				if err := applySignatureToInput(&signedPacket.Inputs[i], signatures[i]); err != nil {
+					return nil, fmt.Errorf("failed to apply signature to input %d: %v", i, err)
+				}
+			}
+		}
+	}
+
+	// Finalize the PSBT if all inputs are signed
+	if isPSBTFullySigned(&signedPacket) {
+		if err := finalizePSBT(&signedPacket); err != nil {
+			return nil, fmt.Errorf("failed to finalize PSBT: %v", err)
+		}
+	}
+
+	return &signedPacket, nil
+}
+
+// applySignatureToInput applies a signature to a specific PSBT input
+func applySignatureToInput(input *psbtlib.PInput, signature []byte) error {
+	// Create a partial signature entry
+	partialSig := &psbtlib.PartialSig{
+		PubKey:    nil, // Will be set based on the input's witness script or redeem script
+		Signature: signature,
+	}
+
+	// Add the partial signature to the input
+	input.PartialSigs = append(input.PartialSigs, partialSig)
+
+	return nil
+}
+
+// isPSBTFullySigned checks if all inputs in the PSBT are fully signed
+func isPSBTFullySigned(packet *psbtlib.Packet) bool {
+	for _, input := range packet.Inputs {
+		if !isInputFullySigned(&input) {
+			return false
+		}
+	}
+	return true
+}
+
+// isInputFullySigned checks if a specific input is fully signed
+func isInputFullySigned(input *psbtlib.PInput) bool {
+	// Check if we have the required number of signatures
+	// This is a simplified check - in a real implementation, you'd check against
+	// the actual script requirements (e.g., M-of-N multisig)
+	return len(input.PartialSigs) > 0
+}
+
+// finalizePSBT finalizes the PSBT by extracting the final transaction
+func finalizePSBT(packet *psbtlib.Packet) error {
+	// Use the btcutil PSBT library's finalize method
+	err := psbtlib.Finalize(packet)
+	if err != nil {
+		return fmt.Errorf("failed to finalize PSBT: %v", err)
+	}
+
+	return nil
 }
 
 // createShamirShares creates Shamir's Secret Sharing shares
@@ -245,9 +326,20 @@ func createShamirShares(secret []byte, totalShares, threshold int) ([][]byte, er
 
 // ValidateSignature validates a signature against a public key
 func ValidateSignature(message []byte, signature []byte, publicKey []byte) bool {
-	// Simple validation - in real implementation this would use proper cryptographic verification
-	expectedHash := sha256.Sum256(message)
-	return len(signature) == len(expectedHash)
+	// Parse the public key
+	pubKey, err := btcec.ParsePubKey(publicKey)
+	if err != nil {
+		return false
+	}
+
+	// Parse the signature
+	sig, err := btcec.ParseSignature(signature, btcec.S256())
+	if err != nil {
+		return false
+	}
+
+	// Verify the signature
+	return sig.Verify(message, pubKey)
 }
 
 // GetPublicKey returns the public key as hex string
