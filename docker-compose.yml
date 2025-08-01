@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  # 0xBridge Application
+  bridge:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - BITCOIN_RPC_HOST=bitcoin:8332
+      - BITCOIN_RPC_USER=0xbridge
+      - BITCOIN_RPC_PASS=0xbridge123
+      - FEE_COLLECTOR_ADDRESS=bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh
+    depends_on:
+      - bitcoin
+    networks:
+      - 0xbridge-network
+    restart: unless-stopped
+
+  # Bitcoin Core (for testing)
+  bitcoin:
+    image: kylemanna/bitcoind:latest
+    ports:
+      - "8332:8332"
+      - "8333:8333"
+    environment:
+      - BITCOIN_RPC_USER=0xbridge
+      - BITCOIN_RPC_PASSWORD=0xbridge123
+      - BITCOIN_RPC_ALLOW_IP=0.0.0.0/0
+    volumes:
+      - bitcoin-data:/data
+    networks:
+      - 0xbridge-network
+    restart: unless-stopped
+    command: >
+      bitcoind
+      -rpcuser=0xbridge
+      -rpcpassword=0xbridge123
+      -rpcallowip=0.0.0.0/0
+      -rpcbind=0.0.0.0:8332
+      -regtest=1
+      -txindex=1
+      -server=1
+
+  # Redis (for caching and session management)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - 0xbridge-network
+    restart: unless-stopped
+
+volumes:
+  bitcoin-data:
+  redis-data:
+
+networks:
+  0xbridge-network:
+    driver: bridge 
