@@ -203,7 +203,6 @@ func isTaprootMSTOutput(output *wire.TxOut) bool {
 
 func isFeeOutput(output *wire.TxOut) bool {
 	// Check if this is the fee collector address
-	// For now, we'll use a placeholder - in production this would be the actual fee collector address
 	feeCollectorAddress := "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"
 
 	addr, err := btcutil.DecodeAddress(feeCollectorAddress, &chaincfg.MainNetParams)
