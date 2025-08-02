@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"sync"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	psbtlib "github.com/btcsuite/btcutil/psbt"
+	psbtlib "github.com/btcsuite/btcd/btcutil/psbt"
 )
 
 // AVSSigner represents an AVS node that can sign PSBTs
@@ -72,11 +74,10 @@ func NewAVSSigner(nodeID string) (*AVSSigner, error) {
 	}, nil
 }
 
-// NewConsensusManager creates a new consensus manager
 func NewConsensusManager() *ConsensusManager {
 	return &ConsensusManager{
 		Nodes:     make(map[string]*AVSSigner),
-		Threshold: 3, // 2/3 threshold for 5 nodes
+		Threshold: 3,
 	}
 }
 
@@ -158,12 +159,10 @@ func CreateMockAVSNetwork() *MockAVSNetwork {
 	return createMockAVSNetwork()
 }
 
-// MockAVSNetwork represents a mock AVS network for testing
 type MockAVSNetwork struct {
 	Nodes map[string]*AVSSigner
 }
 
-// GetConsensusSignatures gets consensus signatures from the AVS network
 func (network *MockAVSNetwork) GetConsensusSignatures(packet interface{}) ([][]byte, error) {
 	signatures := make([][]byte, 0)
 
@@ -215,10 +214,119 @@ func (avs *AVSSigner) SignPSBT(packet interface{}) ([]byte, error) {
 
 // hashPSBT creates a hash of the PSBT for signing
 func hashPSBT(packet interface{}) []byte {
-	// In a real implementation, this would hash the actual PSBT data
-	// For now, we'll create a simple hash
-	data := fmt.Sprintf("%v", packet)
-	hash := sha256.Sum256([]byte(data))
+	// Type assert the packet to PSBT
+	psbtPacket, ok := packet.(*psbtlib.Packet)
+	if !ok {
+		// Fallback to simple hash if not a proper PSBT packet
+		data := fmt.Sprintf("%v", packet)
+		hash := sha256.Sum256([]byte(data))
+		return hash[:]
+	}
+
+	// Create a deterministic hash of the PSBT data
+	// We'll hash the transaction data and input/output details
+	var hashData []byte
+
+	// Hash the unsigned transaction
+	if psbtPacket.UnsignedTx != nil {
+		// Add transaction version
+		versionBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(versionBytes, uint32(psbtPacket.UnsignedTx.Version))
+		hashData = append(hashData, versionBytes...)
+
+		// Add input count and input data
+		inputCount := uint32(len(psbtPacket.UnsignedTx.TxIn))
+		inputCountBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(inputCountBytes, inputCount)
+		hashData = append(hashData, inputCountBytes...)
+
+		// Hash each input
+		for _, txIn := range psbtPacket.UnsignedTx.TxIn {
+			// Add previous output hash
+			hashData = append(hashData, txIn.PreviousOutPoint.Hash[:]...)
+
+			// Add previous output index
+			indexBytes := make([]byte, 4)
+			binary.LittleEndian.PutUint32(indexBytes, txIn.PreviousOutPoint.Index)
+			hashData = append(hashData, indexBytes...)
+		}
+
+		// Add output count and output data
+		outputCount := uint32(len(psbtPacket.UnsignedTx.TxOut))
+		outputCountBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(outputCountBytes, outputCount)
+		hashData = append(hashData, outputCountBytes...)
+
+		// Hash each output
+		for _, txOut := range psbtPacket.UnsignedTx.TxOut {
+			// Add output value
+			valueBytes := make([]byte, 8)
+			binary.LittleEndian.PutUint64(valueBytes, uint64(txOut.Value))
+			hashData = append(hashData, valueBytes...)
+
+			// Add output script
+			hashData = append(hashData, txOut.PkScript...)
+		}
+
+		// Add locktime
+		locktimeBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(locktimeBytes, uint32(psbtPacket.UnsignedTx.LockTime))
+		hashData = append(hashData, locktimeBytes...)
+	}
+
+	// Add PSBT-specific data from inputs
+	for i, input := range psbtPacket.Inputs {
+		// Add input index to make the hash deterministic
+		inputIndexBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(inputIndexBytes, uint32(i))
+		hashData = append(hashData, inputIndexBytes...)
+
+		// Add witness script if present
+		if input.WitnessScript != nil {
+			hashData = append(hashData, input.WitnessScript...)
+		}
+
+		// Add redeem script if present
+		if input.RedeemScript != nil {
+			hashData = append(hashData, input.RedeemScript...)
+		}
+
+		// Add taproot internal key if present
+		if input.TaprootInternalKey != nil {
+			hashData = append(hashData, input.TaprootInternalKey...)
+		}
+
+		// Add taproot merkle root if present
+		if input.TaprootMerkleRoot != nil {
+			hashData = append(hashData, input.TaprootMerkleRoot...)
+		}
+	}
+
+	// Add PSBT-specific data from outputs
+	for i, output := range psbtPacket.Outputs {
+		// Add output index to make the hash deterministic
+		outputIndexBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(outputIndexBytes, uint32(i))
+		hashData = append(hashData, outputIndexBytes...)
+
+		// Add witness script if present
+		if output.WitnessScript != nil {
+			hashData = append(hashData, output.WitnessScript...)
+		}
+
+		// Add redeem script if present
+		if output.RedeemScript != nil {
+			hashData = append(hashData, output.RedeemScript...)
+		}
+
+		// Add taproot internal key if present
+		if output.TaprootInternalKey != nil {
+			hashData = append(hashData, output.TaprootInternalKey...)
+		}
+	}
+
+	// Create the final hash
+	hash := sha256.Sum256(hashData)
 	return hash[:]
 }
 
@@ -299,7 +407,6 @@ func extractPublicKeyFromInput(input *psbtlib.PInput) []byte {
 		}
 	}
 
-	// Try to extract from redeem script
 	if input.RedeemScript != nil {
 		if pubKey := extractPublicKeyFromScript(input.RedeemScript); len(pubKey) > 0 {
 			return pubKey
@@ -314,19 +421,17 @@ func extractPublicKeyFromInput(input *psbtlib.PInput) []byte {
 	return nil
 }
 
-// extractPublicKeyFromScript attempts to extract a public key from a script
 func extractPublicKeyFromScript(script []byte) []byte {
 	if len(script) < 2 {
 		return nil
 	}
 
-	// Look for a 33-byte or 65-byte public key in the script
 	for i := 0; i < len(script)-1; i++ {
-		if script[i] == 0x21 { // Push 33 bytes
+		if script[i] == 0x21 {
 			if i+34 <= len(script) {
 				return script[i+1 : i+34]
 			}
-		} else if script[i] == 0x41 { // Push 65 bytes
+		} else if script[i] == 0x41 {
 			if i+66 <= len(script) {
 				return script[i+1 : i+66]
 			}
@@ -393,13 +498,11 @@ func getRequiredSignatures(input *psbtlib.PInput) (int, error) {
 		return getNonWitnessSignatureRequirements(input)
 	}
 
-	// If we can't determine the script type, assume single signature
 	return 1, nil
 }
 
-// getTaprootSignatureRequirements determines signature requirements for Taproot inputs
 func getTaprootSignatureRequirements(input *psbtlib.PInput) (int, error) {
-	// For Taproot key path spending, only one signature is required
+
 	if input.TaprootInternalKey != nil && len(input.TaprootKeySpendSig) > 0 {
 		return 1, nil
 	}
@@ -492,13 +595,13 @@ func parseScriptSignatureRequirements(script []byte) (int, error) {
 
 // isP2PKHScript checks if a script is a P2PKH script
 func isP2PKHScript(pkScript []byte) bool {
-	// P2PKH script: OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG
+
 	if len(pkScript) == 25 &&
 		pkScript[0] == 0x76 && // OP_DUP
 		pkScript[1] == 0xa9 && // OP_HASH160
 		pkScript[2] == 0x14 && // Push 20 bytes
-		pkScript[23] == 0x88 && // OP_EQUALVERIFY
-		pkScript[24] == 0xac { // OP_CHECKSIG
+		pkScript[23] == 0x88 &&
+		pkScript[24] == 0xac {
 		return true
 	}
 	return false
@@ -541,28 +644,160 @@ func finalizePSBT(packet *psbtlib.Packet) error {
 
 // createShamirShares creates Shamir's Secret Sharing shares
 func createShamirShares(secret []byte, totalShares, threshold int) ([][]byte, error) {
-	// This is a simplified implementation
-	// In a real implementation, you would use a proper Shamir's Secret Sharing library
+	if threshold > totalShares {
+		return nil, fmt.Errorf("threshold cannot be greater than total shares")
+	}
+	if threshold < 1 {
+		return nil, fmt.Errorf("threshold must be at least 1")
+	}
+	if len(secret) == 0 {
+		return nil, fmt.Errorf("secret cannot be empty")
+	}
 
-	shares := make([][]byte, totalShares)
+	// Use a prime field for arithmetic (2^256 - 2^32 - 2^9 - 2^8 - 2^7 - 2^6 - 2^4 - 1)
+	// This is the same prime used in Bitcoin's secp256k1 curve
+	prime := new(big.Int)
+	prime.SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16)
 
-	for i := 0; i < totalShares; i++ {
-		// Create a simple share by XORing with a random value
-		share := make([]byte, len(secret))
-		copy(share, secret)
+	// Convert secret to a big integer
+	secretInt := new(big.Int).SetBytes(secret)
+	if secretInt.Cmp(prime) >= 0 {
+		return nil, fmt.Errorf("secret is too large for the field")
+	}
 
-		// Add some randomness to make it a proper share
-		randomBytes := make([]byte, len(secret))
-		rand.Read(randomBytes)
+	// Generate random coefficients for the polynomial
+	coefficients := make([]*big.Int, threshold)
+	coefficients[0] = secretInt // f(0) = secret
 
-		for j := range share {
-			share[j] ^= randomBytes[j]
+	// Generate random coefficients for x^1, x^2, ..., x^(threshold-1)
+	for i := 1; i < threshold; i++ {
+		coeff := new(big.Int)
+		for {
+			coeff.SetBytes(make([]byte, 32))
+			_, err := rand.Read(coeff.Bytes())
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate random coefficient: %v", err)
+			}
+			coeff.Mod(coeff, prime)
+			if coeff.Sign() > 0 {
+				break
+			}
 		}
+		coefficients[i] = coeff
+	}
 
-		shares[i] = share
+	// Generate shares by evaluating the polynomial at different points
+	shares := make([][]byte, totalShares)
+	for i := 1; i <= totalShares; i++ {
+		// Evaluate polynomial at x = i
+		x := big.NewInt(int64(i))
+		y := evaluatePolynomial(coefficients, x, prime)
+
+		// Create share as (x, y) pair
+		share := make([]byte, 0, 64)
+		share = append(share, x.Bytes()...)
+		share = append(share, y.Bytes()...)
+		shares[i-1] = share
 	}
 
 	return shares, nil
+}
+
+// evaluatePolynomial evaluates a polynomial at a given point using Horner's method
+func evaluatePolynomial(coefficients []*big.Int, x *big.Int, prime *big.Int) *big.Int {
+	result := new(big.Int)
+	result.Set(coefficients[len(coefficients)-1])
+
+	for i := len(coefficients) - 2; i >= 0; i-- {
+		result.Mul(result, x)
+		result.Mod(result, prime)
+		result.Add(result, coefficients[i])
+		result.Mod(result, prime)
+	}
+
+	return result
+}
+
+// reconstructSecret reconstructs the secret from shares using Lagrange interpolation
+func reconstructSecret(shares [][]byte, threshold int) ([]byte, error) {
+	if len(shares) < threshold {
+		return nil, fmt.Errorf("insufficient shares: got %d, need %d", len(shares), threshold)
+	}
+
+	// Use the same prime field
+	prime := new(big.Int)
+	prime.SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16)
+
+	// Parse shares to get (x, y) coordinates
+	points := make([]struct {
+		x, y *big.Int
+	}, len(shares))
+
+	for i, share := range shares {
+		if len(share) < 64 {
+			return nil, fmt.Errorf("invalid share format")
+		}
+
+		x := new(big.Int).SetBytes(share[:32])
+		y := new(big.Int).SetBytes(share[32:])
+
+		points[i].x = x
+		points[i].y = y
+	}
+
+	// Use Lagrange interpolation to reconstruct the secret (f(0))
+	secret := new(big.Int)
+
+	for i := 0; i < threshold; i++ {
+		// Calculate Lagrange coefficient for point i
+		lagrangeCoeff := calculateLagrangeCoefficient(points, i, threshold, prime)
+
+		// Add contribution from this point
+		contribution := new(big.Int).Mul(points[i].y, lagrangeCoeff)
+		contribution.Mod(contribution, prime)
+
+		secret.Add(secret, contribution)
+		secret.Mod(secret, prime)
+	}
+
+	return secret.Bytes(), nil
+}
+
+// calculateLagrangeCoefficient calculates the Lagrange coefficient for a given point
+func calculateLagrangeCoefficient(points []struct {
+	x, y *big.Int
+}, pointIndex, threshold int, prime *big.Int) *big.Int {
+	numerator := big.NewInt(1)
+	denominator := big.NewInt(1)
+
+	// Target x-coordinate (0 for secret reconstruction)
+	targetX := big.NewInt(0)
+
+	for j := 0; j < threshold; j++ {
+		if j != pointIndex {
+			// Numerator: (targetX - x_j)
+			term := new(big.Int).Sub(targetX, points[j].x)
+			numerator.Mul(numerator, term)
+			numerator.Mod(numerator, prime)
+
+			// Denominator: (x_i - x_j)
+			term = new(big.Int).Sub(points[pointIndex].x, points[j].x)
+			denominator.Mul(denominator, term)
+			denominator.Mod(denominator, prime)
+		}
+	}
+
+	// Calculate modular multiplicative inverse of denominator
+	denominatorInv := new(big.Int).ModInverse(denominator, prime)
+	if denominatorInv == nil {
+		panic("denominator has no modular inverse")
+	}
+
+	// Return numerator * denominator^(-1) mod prime
+	result := new(big.Int).Mul(numerator, denominatorInv)
+	result.Mod(result, prime)
+
+	return result
 }
 
 // ValidateSignature validates a signature against a public key
